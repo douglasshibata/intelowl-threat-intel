@@ -1,0 +1,198 @@
+version: '3.8'
+
+services:
+  # --- DATABASE (PostgreSQL - SSOT) ---
+  db:
+    image: postgres:15-alpine
+    container_name: intelowl_db
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-intelowl}
+      POSTGRES_USER: ${POSTGRES_USER:-intelowl_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-SuperSecurePassword123!}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - intelowl_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-intelowl_user} -d ${POSTGRES_DB:-intelowl}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # --- CACHING & TASK BROKER (Redis) ---
+  redis:
+    image: redis:7-alpine
+    container_name: intelowl_redis
+    restart: always
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-SuperSecureRedisPassword456!}
+    volumes:
+      - redis_data:/data
+    networks:
+      - intelowl_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-SuperSecureRedisPassword456!}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # --- CORE ENGINE: django API / Webserver ---
+  web:
+    image: intelowlproject/intelowl:latest
+    container_name: intelowl_webserver
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DJANGO_SETTINGS_MODULE=intel_owl.settings
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    volumes:
+      - static_volume:/opt/intelowl/static
+      - media_volume:/opt/intelowl/media
+      - certs_volume:/opt/intelowl/certs
+    networks:
+      - intelowl_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # --- CELERY ASYNCHRONOUS WORKERS (Split by priority/queues) ---
+
+  # Worker specialized in quick observable analytical tasks (IPs, Domains, Hashes, URLs)
+  celery_worker_observables:
+    image: intelowlproject/intelowl:latest
+    container_name: intelowl_worker_observables
+    restart: always
+    command: celery -A intel_owl worker -l INFO -Q celery_observable_queue -c 4 --max-tasks-per-child=100
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    volumes:
+      - media_volume:/opt/intelowl/media
+    networks:
+      - intelowl_net
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  # Worker specialized in heavy/long-running file analysis and sandboxes (YARA, Cuckoo, etc)
+  celery_worker_files:
+    image: intelowlproject/intelowl:latest
+    container_name: intelowl_worker_files
+    restart: always
+    command: celery -A intel_owl worker -l INFO -Q celery_file_queue -c 2 --max-tasks-per-child=50
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    volumes:
+      - media_volume:/opt/intelowl/media
+    networks:
+      - intelowl_net
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+
+  # Celery Beat for scheduling periodic cleanups, feeds updates, and rule updates
+  celery_beat:
+    image: intelowlproject/intelowl:latest
+    container_name: intelowl_beat
+    restart: always
+    command: celery -A intel_owl beat -l INFO
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    networks:
+      - intelowl_net
+
+  # --- FRONTEND UI & REVERSE PROXY (NGINX) ---
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: intelowl_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - static_volume:/opt/intelowl/static:ro
+      - media_volume:/opt/intelowl/media:ro
+    depends_on:
+      - web
+    networks:
+      - intelowl_net
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && wget -qO- http://localhost:80/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  intelowl_net:
+    driver: bridge
+
+volumes:
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
+  static_volume:
+    driver: local
+  media_volume:
+    driver: local
+  certs_volume:
+    driver: local
